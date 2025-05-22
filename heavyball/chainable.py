@@ -344,7 +344,7 @@ def scale_by_trainable_scale(state_fn, group, update, grad, param):
         state = state_fn(p)
         scale = state["scale"]
         grad_weight = u * scale.to(u.dtype)
-        scale.sub_((u * p).sum().to(scale.dtype), alpha=group["lr"] * group["scale_lr"])
+        scale.sub_(scale * (u * p).sum().to(scale.dtype), alpha=group["lr"] * group["scale_lr"])
         p.mul_(scale)
         updates.append(grad_weight)
     return updates
