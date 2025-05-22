@@ -323,23 +323,31 @@ def scale_by_laprop(group, update, grad, param, exp_avg, exp_avg_sq):
     return utils.laprop_(exp_avg, exp_avg_sq, update, utils.get_beta1(group), utils.get_beta2(group), group["step"])
 
 
-def _init_trainable_scale(state, group, update, grad, param, inner: str = ""):
-    if param.ndim < 2:
-        return
-    state["scale"] = torch.ones((), dtype=param.dtype, device=param.device)
+def unscale_by_trainable_scale(state_fn, group, update, grad, param):
+    for u, p in zip(update, param):
+        if p.ndim < 2:
+            continue
+        state = state_fn(p)
+        if "scale" not in state:
+            state["scale"] = torch.ones((), dtype=torch.float64, device=p.device)
+        p.div_(state["scale"])
+    return update
 
 
-@general_guard("scale", init_fn=_init_trainable_scale, skip_first=False)
-@no_state_no_foreach
-def scale_by_trainable_scale(group, update, grad, param, scale):
-    if param.ndim < 2:
-        return update
-    grad_weight = update * scale
-    grad_scale = (update * param).sum()
-    before_scale = scale.copy()
-    scale.sub_(grad_scale, alpha=group["lr"] * group["scale_lr"])
-    param.mul_(scale / before_scale)
-    return grad_weight
+def scale_by_trainable_scale(state_fn, group, update, grad, param):
+    updates = []
+    for u, p in zip(update, param):
+        if p.ndim < 2:
+            updates.append(u)
+            continue
+
+        state = state_fn(p)
+        scale = state["scale"]
+        grad_weight = u * scale.to(u.dtype)
+        scale.sub_((u * p).sum().to(scale.dtype), alpha=group["lr"] * group["scale_lr"])
+        p.mul_(scale)
+        updates.append(grad_weight)
+    return updates
 
 
 @zero_guard("exp_avg", "exp_avg_sq")

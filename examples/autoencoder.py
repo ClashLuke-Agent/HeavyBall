@@ -91,15 +91,7 @@ def main(epochs: int, batch: int, log_interval: int = 16):
     writer = SummaryWriter(log_dir)
 
     model = torch.compile(Autoencoder().cuda(), mode="default")
-    optimizer = heavyball.PSGDKron(
-        model.parameters(),
-        lr=1e-4,
-        mars=True,
-        lower_bound_beta=0.9,
-        inverse_free=True,
-        precond_update_power_iterations=6,
-        store_triu_as_line=False,
-    )
+    optimizer = heavyball.ScaledMuonLaProp(model.parameters(), lr=0.01)
 
     transform = v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32)])
     train = [img for img, _ in MNIST(root="./data", train=True, download=True, transform=transform)]
