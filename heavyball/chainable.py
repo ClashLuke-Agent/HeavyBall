@@ -323,6 +323,23 @@ def scale_by_laprop(group, update, grad, param, exp_avg, exp_avg_sq):
     return utils.laprop_(exp_avg, exp_avg_sq, update, utils.get_beta1(group), utils.get_beta2(group), group["step"])
 
 
+def _init_trainable_scale(state, group, update, grad, param, inner: str = ""):
+    if param.ndim < 2:
+        return
+    state["scale"] = torch.ones((param.size(0),), dtype=param.dtype, device=param.device)
+
+
+@general_guard("scale", init_fn=_init_trainable_scale, skip_first=False)
+@no_state_no_foreach
+def scale_by_trainable_scale(group, update, grad, param, scale):
+    if param.ndim < 2:
+        return update
+    grad_weight = update * scale.view(-1, *(1,) * (update.ndim - 1))
+    grad_scale = torch.einsum("ij,ij->i", update.flatten(1), param.flatten(1))
+    scale.sub_(grad_scale, alpha=group["lr"] * group["scale_lr"])
+    return grad_weight
+
+
 @zero_guard("exp_avg", "exp_avg_sq")
 @no_state
 def update_by_laprop(group, update, grad, param, exp_avg, exp_avg_sq):
