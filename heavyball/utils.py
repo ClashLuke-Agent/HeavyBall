@@ -366,12 +366,12 @@ def set_torch(benchmark_limit: int = 32, einsum_strategy: str = "auto-hq"):
     )
 
 
-@decorator
+@decorator_knowngood
 def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.to(torch.bfloat16 if G.dtype != torch.float64 else G.dtype)  # Preserve float64 if present
-    X /= X.norm() + eps  # ensure top singular value <= 1
+    X = G if G.dtype == torch.float64 else stochastic_round_(G)
+    stochastic_multiply_(X, G.norm() + eps)  # ensure top singular value <= 1
     if G.size(0) > G.size(1):
         X = X.T
     for _ in range(steps):
@@ -658,7 +658,7 @@ def _compilable_stochastic_add_(x: List[Tensor], y: List[Tensor], alpha: Union[f
         copy_stochastic_(x_, x32 + y32 * alpha)
 
 
-def stochastic_add_(x: List[Tensor], y: List[Tensor], alpha: Union[float, int, Tensor] = 1):
+def stochastic_add_(x: List[Tensor] | Tensor, y: List[Tensor] | Tensor, alpha: Union[float, int, Tensor] = 1):
     x, y = broadcastable_list_guard(x, y)
     alpha = scalar_guard(alpha, x[0])
     _compilable_stochastic_add_(x, y, alpha)
@@ -672,7 +672,9 @@ def _compilable_stochastic_add_divide_(x: List[Tensor], y: List[Tensor], alpha: 
         copy_stochastic_(x_, (x32 + y32 * alpha) / divisor)
 
 
-def stochastic_add_divide_(x: List[Tensor], y: List[Tensor], alpha: Union[float, int, Tensor] = 1, divisor: float = 1):
+def stochastic_add_divide_(
+    x: List[Tensor] | Tensor, y: List[Tensor] | Tensor, alpha: Union[float, int, Tensor] = 1, divisor: float = 1
+):
     x, y = broadcastable_list_guard(x, y)
     alpha, divisor = scalar_guard(alpha, divisor, x[0])
     _compilable_stochastic_add_divide_(x, y, alpha, divisor)
@@ -686,7 +688,7 @@ def _compilable_stochastic_multiply_(x: List[Tensor], y: List[Tensor]):
         copy_stochastic_(x_, x32 * y32)
 
 
-def stochastic_multiply_(x: List[Tensor], y: List[Tensor]):
+def stochastic_multiply_(x: List[Tensor] | Tensor, y: List[Tensor] | Tensor):
     x, y = broadcastable_list_guard(x, y)
     _compilable_stochastic_multiply_(x, y)
 
@@ -905,7 +907,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
     def state_(self, arg: Tensor, fail: bool = True):
         if not fail and arg not in self.mapping:
             return {}
-        state_param, index = self.mapping_inverse[arg]
+        state_param, index = self.mapping_inverse[arg.data_ptr()]
         if state_param not in self.state:
             self.state[state_param] = collections.defaultdict(dict)
         return self.state[state_param][index]
@@ -928,7 +930,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
             if p not in self.mapping:
                 self.mapping[p] = p_views = merge_group(group, p)
                 for i, pv in enumerate(p_views):
-                    self.mapping_inverse[pv] = (p, i)
+                    self.mapping_inverse[pv.data_ptr()] = (p, i)
 
     def split_p_and_g_in_group(
         self,
@@ -954,7 +956,7 @@ class StatefulOptimizer(torch.optim.Optimizer):
             else:
                 self.mapping[p] = p_views = merge_group(group, p)
                 for i, pv in enumerate(p_views):
-                    self.mapping_inverse[pv] = (p, i)
+                    self.mapping_inverse[pv.data_ptr()] = (p, i)
 
             vector = getattr(p, "vector", None)
             hessian_vector = getattr(p, "hessian_vector", None)
@@ -1381,11 +1383,15 @@ def stochastic_round_list_(ref: List[Tensor], source: List[Tensor]):
 
 
 @decorator_knowngood
-def stochastic_round_(ref: Tensor, source: Tensor):
-    if source.dtype == torch.bfloat16 or ref.dtype == source.dtype:
-        return source
-    if ref.dtype != torch.bfloat16:
-        return source.to(ref.dtype)
+def stochastic_round_(ref: Tensor, source: Tensor | None = None):
+    if source is not None:
+        if source.dtype == torch.bfloat16 or ref.dtype == source.dtype:
+            return source
+        if ref.dtype != torch.bfloat16:
+            return source.to(ref.dtype)
+    else:
+        source = ref
+    source = source.float()
     result = torch.randint_like(source, dtype=torch.int32, low=0, high=(1 << 16))
     result.add_(source.view(dtype=torch.int32))
     result.bitwise_and_(-65536)  # -65536 = FFFF0000 as a signed int32
@@ -1444,7 +1450,7 @@ def _max_idx(x: List[int]):
 @decorator_knowngood
 def stable_exp(x: Tensor):
     # fp16:
-    #   exp(x) is stable in [-17, 11]
+    #   exp(x) is stable in [-17, 11]k
     #   `stable_exp` extends to [-17, 17]
     #   average error (in [-10, 10]) increased from 2.288e-3 to 2.299e-3
     # fp32:
@@ -1610,14 +1616,6 @@ def init_Q_exprs(
             # use triangular matrix as preconditioner for this dim
             Q.append(scale * torch.eye(size, dtype=dtype, device=grad.device))
     return Q
-
-
-@decorator_knowngood
-def psgd_balance_Q(Q):
-    norms = [promote(q.norm(float("inf"))).log() for q in Q]
-    geometric_mean = sum([n for n in norms]) / len(Q)
-    for q, n in zip(Q, norms):
-        q *= (geometric_mean - n).exp()
 
 
 @decorator_knowngood
@@ -1940,24 +1938,33 @@ def max_singular_value_exact(A, use_lobpcg: bool = False):
             eigval, _ = torch.compiler.disable(torch.lobpcg)(A, k=1, largest=True)
             return eigval[0].sqrt()
         else:
-            return torch.linalg.svd(A, driver="gesvdj")[1].max()  # == linalg.matrix_norm(A, ord=2)
-    except torch.linalg.LinAlgError:
-        return torch.zeros((), device=A.device, dtype=A.dtype)
+            return torch.linalg.svd(promote(A), driver="gesvdj")[1].max().to(A.dtype)  # == linalg.matrix_norm(A, ord=2)
+    except (torch.linalg.LinAlgError, RuntimeError):
+        return max_singular_value_power_iter(promote(A), iterations=2)
 
 
 @decorator_knowngood
-def max_singular_value_power_iter(A: Tensor, max_abs: Optional[Tensor] = None, iterations: int = 5):
+def max_singular_value_power_iter(A_outer: Tensor, max_abs: Optional[Tensor] = None, iterations: int = 5):
     """
     Rayleigh quotient of row with the largest norm + optional power iterations
     """
-    x_norm, max_idx = A.norm(dim=1).max(dim=0)
-    x = A.index_select(0, max_idx).flatten().contiguous()
-    A = A / x_norm
-    x = x / x_norm
-    for _ in range(iterations):
-        x = A.T.mv(A.mv(x))  # A @ A.T @ x, but explicitly telling torch.compile not to compute the full matrix
-        x = x / x.norm()
-    return (x @ A.T.mv(A.mv(x))).sqrt() * x_norm
+    x_norm, max_idx = A_outer.norm(dim=1).max(dim=0)
+    x_norm = promote(x_norm)
+
+    def _inner():
+        A = A_outer
+        x = A.index_select(0, max_idx).flatten().contiguous()
+        A = stochastic_round_(A / x_norm)
+        x = x / x_norm
+        for _ in range(iterations):
+            x = A.T.mv(
+                A.mv(stochastic_round_(x))
+            )  # A @ A.T @ x, but explicitly telling torch.compile not to compute the full matrix
+            x = x / x.norm()
+        out = (x @ A.T.mv(A.mv(x))).to(x_norm.dtype).sqrt() * x_norm
+        return out.squeeze().clone()
+
+    return torch.cond(x_norm > 0, _inner, lambda: x_norm.squeeze().clone())
 
 
 @decorator_knowngood
@@ -1974,41 +1981,78 @@ def max_singular_value_cholesky(A: Tensor, max_abs: Optional[Tensor] = None):
     return sketch_norm * max_abs
 
 
+def _max_singular_value_ndim(A: Tensor, max_svd: int = 0, use_cholesky: bool = False, power_iter: int = 16) -> Tensor:
+    if A.ndim <= 2:
+        return max_singular_value(A, max_svd, use_cholesky, power_iter)
+
+    base = einsum_base[: A.ndim]
+    A16 = stochastic_round_(A)
+    squares = [compiled_einsum(f"{base},{base.replace(b, b.upper())}->{b}{b.upper()}", A16, A16) for b in base]
+    svds = [max_singular_value(promote(s), max_svd, use_cholesky, power_iter) for s in squares]
+    svds = torch.stack(svds)
+    return svds.max().sqrt().to(A.dtype)  # sqrt because we took the SVD of a squared matrix
+
+
 @decorator_knowngood
-def max_singular_value(
-    A: Tensor, max_abs: Optional[Tensor], max_svd: int = 32, use_cholesky: bool = False, power_iter: int = 0
-) -> Tensor:
+def max_singular_value(A: Tensor, max_svd: int = 0, use_cholesky: bool = False, power_iter: int = 16) -> Tensor:
+    if A.ndim < 2:
+        return A.abs().max()
+    if A.ndim > 2:
+        raise ValueError("max_singular_value: dimension of A must be less than or equal to 2")
     if min(A.shape) <= max_svd:
         return max_singular_value_exact(A)  # SVD needs ~25% more runtime for size=32, but 0% error instead of 5%
     if use_cholesky or power_iter < 0:
-        return max_singular_value_cholesky(A, max_abs)
+        return max_singular_value_cholesky(A)
     return max_singular_value_power_iter(A, None, iterations=power_iter)
 
 
 @decorator_knowngood
-def _psgd_default_preconditioner_grad(
-    terms: List[Tuple[Tensor, Tensor]],
-    Q: List[Tensor],
-) -> List[Tensor]:
-    out = []
-    for q, (x, y) in zip(Q, terms):
-        x = promote(x)
-        y = promote(y)
-        update = x - y
-        if q.ndim < 2:
-            update = q * update
-        else:
-            update = (q @ update).triu()
-        out.append(update)
-    return out
+def min_singular_value(
+    A: Tensor,
+    power_iter: int = 5,
+    safety: float = 1.05,
+    max_svd: int = 32,
+):
+    if A.ndim < 2:
+        return A.abs().min()
+
+    n = A.size(0)
+    if n <= max_svd:
+        try:
+            eigs = torch.linalg.eigvalsh(promote(A))
+            return eigs.min().to(A.dtype)
+        except torch.linalg.LinAlgError:
+            pass
+
+    lambda_max_hat = max_singular_value(A, power_iter=power_iter)
+    lambda_upper = lambda_max_hat * safety
+
+    row_norms = A.norm(dim=1)
+    norm, idx = row_norms.min(dim=0)
+    v = _cond(norm > 0, lambda: A.index_select(0, idx).flatten(), lambda: torch.rand_like(A[0]))
+
+    v = v / promote(v.norm())
+    for _ in range(power_iter):
+        v = lambda_upper * v - promote(A.mv(stochastic_round_(v)))
+        v = v / promote(v.norm())
+    mu_hat = v @ (lambda_upper * v - promote(A.mv(stochastic_round_(v))))
+
+    lambda_min_hat = lambda_upper - mu_hat
+
+    def _approx():
+        mu = A.trace() / n
+        sigma_square = A.square().sum() / n - mu**2
+        return mu - (sigma_square / (n - 1)).sqrt()
+
+    return _cond(
+        (~torch.isfinite(lambda_min_hat)) | (lambda_min_hat <= 0), _approx, lambda: lambda_min_hat.clone()
+    ).squeeze()
 
 
 @decorator_knowngood
-def _balance_to_triu(Q: "TriuOrLine", symmetric_output: bool = False):
+def to_triu(Q: "TriuOrLine", symmetric_output: bool = False):
     if isinstance(Q[0], tuple):
-        psgd_balance_Q([o[1] for o in Q])
         return line_to_triu(Q, symmetric_output)
-    psgd_balance_Q(Q)
     return Q
 
 
@@ -2027,89 +2071,373 @@ def calcG_expr(q_dim, g_dim):
     return exprs
 
 
-@decorator
-def psgd_update_precond(
-    G: Tensor,
-    precond_lr: float,
-    oq: "TriuOrLine",
-    store_triu_as_line: bool,
-    velocity: Optional[List[Tensor]],
-    beta2: float,
-    ortho_method: Optional[str],
-    V: Tensor,
-    running_lower_bound: List[Tensor],
-    lower_bount_beta: float,
-    power_iter: int,
-) -> None:
-    """Update Kronecker product preconditioner Q with pair (V, G)."""
-    Q = _balance_to_triu(oq)
+def eye_like(x: Tensor):
+    if x.ndim < 2:
+        return torch.ones_like(x)
+    assert x.ndim == 2
+    assert x.size(0) == x.size(1)
+    return torch.eye(x.size(0), device=x.device, dtype=x.dtype)
+
+
+@decorator_knowngood
+def _gg_inverse_via_vjp(G: Tensor, Q: List[Tensor]):
+    """
+    Idea:
+        G should be zeroth power. So, all Qs together should approximate the G's inverse.
+        Assuming G is 2-dimensional, we'd have two preconditioning Q's: L, R
+        Optimize LGR being a zeroth power using `MSE( (LGR) (LGR).T , I ) + MSE( (LGR).T + (LGR) , I )`,
+        then backprop to L/R jointly.
+        This function computes the gradients for L/R, with an outer optimizer layer handling the rest.
+
+        `psgd_precond_grad` computes LGR for the general (n-dimensional) case
+        `exprG` contains the einsum expressions to compute (LGR)(LGR).T (and (LGR).T(LGR)) for the general n-dim case
+    Args:
+        G: Gradient that should be orthogonalized
+        Q: List of preconditioner tensors.
+
+    Returns:
+        - List of gradients with respect to Q (d_Q).
+    """
     exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
-    precond_lr, beta2, lower_bount_beta = scalar_guard(precond_lr, beta2, lower_bount_beta, G)
 
-    A, conjB = psgd_calc_A_and_conjB(G, Q, V)
-    terms = [(compiled_einsum(exprG, A, A), compiled_einsum(exprG, conjB, conjB)) for exprG in exprGs]
-    del A, conjB, V
-    updates = _psgd_default_preconditioner_grad(terms, Q)
-    _psgd_precond_update_(
-        updates, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, power_iter
-    )
-    return None
+    G16 = stochastic_round_(G)
+    Q16 = [stochastic_round_(q) for q in Q]
+    P = psgd_precond_grad(G16, Q16)  # Q₀GQ₁
+
+    d_P = torch.zeros_like(G)
+    base = einsum_base[: G.ndim]
+    for i, exprG in enumerate(exprGs):
+        pp = compiled_einsum(exprG, P, P)
+        error = pp - eye_like(pp)
+        dim = einsum_base[i]
+        if pp.ndim == 2:
+            new = dim.upper()
+            prec = f"{new}{dim}"
+        else:
+            new = dim
+            prec = dim
+        d_P += torch.einsum(f"{base},{prec}->{base.replace(dim, new)}", P, error)
+
+    d_P = stochastic_round_(d_P)  # accumulate in fp32 and round at the end
+    grads = []
+    for i, exprG in enumerate(exprGs):
+        new_q = Q16[:]
+        new_q[i] = eye_like(new_q[i])
+        pq = psgd_precond_grad(G16, new_q)
+        grad = compiled_einsum(exprG, pq, d_P)
+        if grad.ndim == 2:
+            grad = (grad + grad.T) / 2
+        grads.append(grad)
+
+    return grads, P.to(G.dtype)
+
+
+def _inverse_initial_guess(gg):
+    n = gg.shape[0]
+
+    sigma_max = promote(gg.norm())
+
+    trace_gg = promote(torch.trace(gg))
+    sigma_min_approx = trace_gg / (n * sigma_max)
+
+    return sigma_max, sigma_min_approx
 
 
 @decorator_knowngood
-def _psgd_precond_update_(
-    matmuled: List[Optional[Tensor]],
-    Q: "TriuOrLine",
-    running_lower_bound: List[Tensor],
-    lower_bount_beta: Tensor,
+def _chebychef_coeff(degree: int, device, eps: float = 1e-8):
+    k = torch.arange(degree, dtype=torch.float64, device=device)
+    rotation = (2 * k + 1) * math.pi / (2 * degree)
+    f = (rotation.cos() + 1 + eps) ** -0.5
+    rotation = (rotation.view(-1, 1) * k[1:].view(1, -1)).cos()
+    coeff0 = f.sum() / degree
+    coeffs = f @ rotation * 2 / degree
+    return coeff0.float(), coeffs.float()
+
+
+@decorator_knowngood
+def bf16_matmul(x: Tensor, y: Tensor):
+    return (promote(x) @ promote(y)).to(x.dtype)
+
+
+@decorator_knowngood
+def _inverse_approx_via_chebychev(gg: Tensor, degree: int = 6):
+    """
+    This function is a helper for `_gg_inverse_via_newtonschulz` to compute a better initial guess.
+    It cannot be used by itself.
+    """
+    coeff0, coeffs = _chebychef_coeff(degree, gg.device)
+
+    sigma_max, sigma_min = _inverse_initial_guess(gg)
+    c = 2.0 / (sigma_max + sigma_min)
+    d = (sigma_max - sigma_min) / (sigma_max + sigma_min)
+
+    gg = promote(gg)
+    I = eye_like(gg)
+    B = c * gg - d * I
+    inverse = coeff0 * I
+
+    T_prev, T_curr = I, B
+    for c in coeffs:
+        stochastic_add_(inverse, T_curr, c)
+        T_prev, T_curr = T_curr, 2 * bf16_matmul(B, T_curr) - T_prev
+
+    return inverse * c.sqrt()
+
+
+def _while_loop(cond, body, state):
+    """
+    dispatches to torch.while_loop if we're compiling. otherwise, falls back to a naive + slow baseline
+    useful for debugging
+    """
+    if torch.compiler.is_compiling():
+        return torch.while_loop(cond, body, state)
+
+    while cond(*state).item():
+        state = body(*state)
+    return state
+
+
+def _cond(cond, true_fn, false_fn):
+    """
+    dispatches to torch.cond if we're compiling. otherwise, falls back to a naive + slow baseline
+    useful for debugging
+    """
+    if torch.compiler.is_compiling():
+        return torch.cond(cond, true_fn, false_fn)
+
+    if cond.item():
+        return true_fn()
+    return false_fn()
+
+
+def _cond_n(cond, *fns):
+    fns = list(fns)
+    fn = fns.pop(0)
+    if not fns:
+        return fn
+    return _cond(cond == 0, fn, lambda: _cond_n(cond - 1, *fns))
+
+
+@decorator_knowngood
+def matrix_square_root(
+    A: Tensor,
+    order: int = 1,
+    max_steps: int = 10,
+    error_threshold: float = 1e-5,
+) -> Tensor:
+    """
+    Newton–Schulz principal square root of a symmetric positive-definite matrix
+    using `torch.while_loop` for Inductor-friendly control flow.
+
+        Returns S ≈ A½ after ≤ `max_steps` iterations, or earlier if
+        ‖I − S²‖∞ ≤ `error_threshold`.
+    """
+    if A.ndim < 2:
+        return A.sqrt()
+
+    assert A.size(0) == A.size(1)
+    # Horner coefficients of P_k(x) = Σ_{i=0}^k C(2i,i) x^{k−i} / 4^i
+    coeffs = [math.comb(2 * k, k) / 4**k for k in range(order + 1)]
+
+    dtype = A.dtype
+    A = promote(A)
+    I = eye_like(A)
+    scale = A.abs().max().clamp(min=1e-8)
+    A = A / scale
+
+    def _cond(_approx, error, step):
+        err = error.abs().max()
+        return (err > error_threshold) & (step < max_steps)
+
+    def _body(approx, error, step):
+        # Horner evaluation of P_k(E_k)
+        P = coeffs[-1] * I
+        for ck in reversed(coeffs[:-1]):
+            P = bf16_matmul(P, error) + ck * I
+
+        new_approx = bf16_matmul(approx, P)  # X_{k+1} = X_k P_k(E_k)
+        new_approx = (new_approx + new_approx.T) / 2  # enforce symmetric
+        error = I - bf16_matmul(approx, approx)  # E_k
+
+        return new_approx, error, step + 1
+
+    init_state = (A, I - A @ A, torch.zeros((), dtype=torch.int64, device=A.device))
+    final_approx, _, _ = _while_loop(_cond, _body, init_state)
+    return final_approx.to(dtype) * scale**0.5
+
+
+def newton_schulz_inverse(X: Tensor, eps: float = 1e-6, iterations: int = 5):
+    X = X + eye_like(X) * eps
+    if X.ndim < 2 or X.numel() == 1:
+        return 1 / X
+
+    # guess = _inverse_approx_via_chebychev(X)
+    guess = eye_like(X)
+    for _ in range(iterations):
+        guess = 1.5 * guess - bf16_matmul(bf16_matmul(guess, X), X) * 0.5
+    return guess
+
+
+def multiply(A: Tensor, B: Tensor):
+    if A.ndim < 2 and B.ndim < 2:
+        return A * B
+    return A @ B
+
+
+def project_simplex(v: torch.Tensor, s: float | torch.Tensor = 1.0) -> torch.Tensor:
+    orig_shape = v.shape
+    v_flat = v.reshape(-1)
+
+    v_sorted, _ = torch.sort(v_flat, descending=True)
+    cssv = torch.cumsum(v_sorted, 0) - s
+
+    arange1 = torch.arange(1, v_sorted.numel() + 1, device=v.device, dtype=v.dtype)
+    active_mask = v_sorted * arange1 > cssv
+    k = active_mask.sum() - 1
+    theta = torch.index_select(cssv, 0, k) / (k + 1)
+    return (v - theta).clamp(min=0).reshape(orig_shape)
+
+
+@decorator_knowngood
+def anderson_step(values, gradients, beta: float = 1, eps: float = 1e-3):
+    Q, R = values, gradients
+
+    G = (R @ R.T).double()
+    rhs = torch.ones_like(G[0])
+
+    # Solve (G + εI) γ = 1
+
+    eye = eye_like(G) * eps
+    L, info = torch.linalg.cholesky_ex(G + eye)
+
+    def _cholesky_solve():
+        return torch.cholesky_solve(rhs.unsqueeze(1), L).squeeze(1)
+
+    def _fallback():
+        return (torch.arange(rhs.numel(), device=G.device) == (rhs.numel() - 1)).to(G.dtype)
+
+    gamma = _cond(info == 0, _cholesky_solve, _fallback)
+    gamma_proj = project_simplex(gamma)  # Normalize(ReLU(gamma), p=1)
+    return (promote(Q) - beta * promote(R)).T @ gamma_proj.to(torch.float32)
+
+
+@decorator_knowngood
+def _gg_inverse_via_newtonschulz(
+    G: Tensor,
+    oq: "TriuOrLine",
+    inverse_order: int,
     precond_lr: Tensor,
-    store_triu_as_line: bool,
-    power_iter: int,
+    eps: float = 1e-6,
+    norm_eps: float = 1e-6,
+    min_update_step: float = 1e-6,
+    svd_power_iter: int = 1,
+    max_grad_norm: float = 0.01,
 ):
-    for update, oq, lb_state in zip(matmuled, Q, running_lower_bound):
-        if isinstance(oq, tuple):
+    """
+    Idea:
+        Q approximates G^-1
+        For matrices: G = Q @ (2 * I - GG.T @ Q) == NewtonSchulz*
+        For scalars/vectors: directly compute the corret inverse
+        ---
+        * Assuming GG.T should be inverted, NewtonSchulz wants Q(2I - GG.TQ)
+          However, computing Q@GG.T@Q with respect to the unused preconditioners is costly.
+          So, we precompute QG and run `(QG)@(QG).T == QGG.TQ.T`
+          With a symmetric Q, we get QGG.TQ.T = QGG.TQ - precisely the update we need for the NS iteration
+          Further, Q @ (2 * I - GG.T @ Q) == 2 * Q - Q @ GG.T @ Q. So, the update becomes 2Q-(QG)@(QG).T
+
+    Args:
+        G: Gradient tensor to be preconditioned (gradient of the loss w.r.t. parameters)
+        Q: List of preconditioner tensors
+        order: Number of Newton-Schulz iterations
+        power_iter: Power iterations used in initial precond estimate
+
+    Hints:
+        * more `power_iter` -> better initial guess -> lower `order` required (recommended <20)
+        * higher `order` -> higher general accuracy -> lower `power_iter` required (recommended <80)
+        * `order` is more expensive but will yield rewards for longer. with large batches, both should be set high.
+
+    Returns:
+        - List of gradients with respect to Q (d_Q).
+
+    """
+    Q = to_triu(oq, True)
+    exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
+    dim_size = [max(q.numel(), 1) if q.ndim < 2 else q.size(0) for q in Q]
+
+    scale = _max_singular_value_ndim(G, power_iter=svd_power_iter)
+    G16 = stochastic_round_(G / scale)  # max singular value of GG should be <1
+    preconds = [q.clone() for q in Q]
+
+    if len(preconds) == 1 and preconds[0].ndim < 2:
+        inverse_order = 1  # there's no need to rebalance multiple times if we have only one exact solution
+
+    def _step(old_preconds, new_preconds, _P0, step, update_norm):
+        max_error = max((o - n).abs().max() for o, n in zip(old_preconds, new_preconds))
+        return (max_error > min_update_step) & (step < inverse_order) & (update_norm > norm_eps)
+
+    def _body(_old_preconds, preconds, P0, step, norm):
+        P = precond_grad_cached_(G16, [stochastic_round_(p) for p in preconds])  # LLᵀGRRᵀ
+        P0 = _cond(step == 0, lambda: P.to(G.dtype).contiguous().clone(), lambda: P0.contiguous().clone())
+
+        new_preconds = []
+        norms = []
+        for p, exprG, size in zip(preconds, exprGs, dim_size):
+            # PP = (LLᵀGRRᵀ)(LLᵀGRRᵀ)ᵀ == LLᵀGRRᵀRᵀRGᵀLᵀL == LLXLL (with symmetric L/R)
+            PP = compiled_einsum(exprG, P, P)
+
+            def _update():
+                # scale = size / P.numel()  # rescale, as X@X.T sums over X.size(1) items - we want it to
+                if p.ndim == 2 and p.numel() > 1:
+                    new = (
+                        promote(p) - promote(PP) / 2
+                    )  # / (1 + promote(PP.norm()) / promote(p.norm()))  # adaptive damping
+                    return (new + new.T) / 2  # ensure new_Q is symmetric
+                else:  # for scalar/vector L, PP is a vector -> LL/LXL == 1/sqrt(X)
+                    X_estimate = PP.double() / p.double().square().clamp(min=eps)
+                    return (1 / X_estimate.clamp(min=eps)).to(p.dtype)
+
+            norms.append(PP.norm())
+            new_preconds.append(_cond(norms[-1] > norm_eps, _update, lambda: p.clone()))
+
+        retval = preconds, new_preconds, P0.contiguous(), step + 1, sum(norms)
+        return tree_map(torch.clone, retval)
+
+    init_state = (
+        [torch.zeros_like(p) for p in preconds],
+        preconds,
+        G.contiguous(),
+        torch.zeros((), dtype=torch.int64, device=G.device),
+        torch.ones((), dtype=G16.dtype, device=G16.device),
+    )
+    _, preconds, P0, _, _ = _while_loop(_step, _body, init_state)
+
+    for new_q, oq in zip(preconds, Q):
+        store_triu_as_line = isinstance(oq, tuple)
+        if store_triu_as_line:
+            store_triu_as_line = True
             oq = oq[1]
-
         q = promote(oq)
-        if update.ndim < 2:
-            lb = update.norm(float("inf"))
-        else:
-            lb = max_singular_value(update, None, power_iter=power_iter)
-            update = promote(update)
-            if store_triu_as_line:
-                update = triu_to_line([update])[0][1]
 
-        lb = promote(lb)
-        lb = lb.maximum(promote(lb_state) + (lb - promote(lb_state)) * (1 - lower_bount_beta))
-        copy_stochastic_(lb_state, lb)
-        copy_stochastic_(oq, q - update / lb * precond_lr)
+        new_q = promote(new_q)
+        # new_q *= scale  # technically, we need to multiply here to get the correct inverse. practically, maxsvd
+        if new_q.ndim == 2:
+            if q.shape != new_q.shape:
+                q = line_to_triu([(new_q.shape, q)], symmetric_output=True)[0]
 
+        delta = eye_like(new_q) + precond_lr * (new_q - q)
+        delta = delta / max_singular_value(delta, power_iter=svd_power_iter).clamp(min=eps)  # align update magnitudes
+        delta = delta * (max_grad_norm * q.norm() / delta.norm().clamp(min=eps)).clamp(min=1)  # grad clip
+        new_q = multiply(multiply(delta, q), delta)  # multiplicative update rule in the lie group, from Xilin's QUAD
 
-@decorator_knowngood
-def _psgd_quad_preconditioner_grad(GG: List[Tensor], Q: List[Tensor], numel: int):
-    """
-    I: Identity
-    U: Update / gg / target
-    Q: q, preconditioner
-    scale: scalar scale
-    ---
-    U = T * scale - I
-    F = I - U  # = 2I - U * scale
-    O = F @ Q @ F - Q
-    """
-    out = []
-    for gg, q in zip(GG, Q):
-        if gg.ndim < 2:
-            scale = max(1, gg.numel()) / numel
-            target = promote(gg)
-            update = target * scale - 1
-            out.append(q - (1 - update) * q * (1 - update))
-        else:
-            scale = gg.size(0) / numel
-            gg = 2 * torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype) - gg * scale
-            update = q - gg @ q @ gg
-            out.append(update + update.T)  # make matrix symmetric
-    return out
+        if new_q.ndim == 2:
+            new_q = (new_q + new_q.T) / 2
+        new_q = new_q / max_singular_value(new_q, power_iter=svd_power_iter).clamp(min=eps)  # ensure update is stable
+
+        if store_triu_as_line and new_q.ndim == 2:
+            new_q = triu_to_line([new_q])[0][1]
+        copy_stochastic_(oq, new_q)
+
+    return P0
 
 
 @decorator
@@ -2125,6 +2453,7 @@ def inverse_free_psgd_update_precond(
     running_lower_bound: List[Tensor],
     lower_bount_beta: float,
     power_iter: int,
+    step: Tensor,
 ) -> Tensor:
     """Update Kronecker product preconditioner Q with pair (V, G)."""
     assert V is None
@@ -2132,17 +2461,8 @@ def inverse_free_psgd_update_precond(
     assert velocity is None
     del V, ortho_method, velocity
 
-    Q = _balance_to_triu(oq, True)
     precond_lr, beta2, lower_bount_beta = scalar_guard(precond_lr, beta2, lower_bount_beta, G)
-    exprGs = calcG_expr(ndim_tuple(Q), G.ndim)
-
-    G = psgd_precond_grad(G, Q)
-    terms = [compiled_einsum(exprG, G, G) for exprG in exprGs]
-    matmuled = _psgd_quad_preconditioner_grad(terms, Q, G.numel())
-    _psgd_precond_update_(
-        matmuled, oq, running_lower_bound, lower_bount_beta, precond_lr, store_triu_as_line, power_iter
-    )
-    return G
+    return _gg_inverse_via_newtonschulz(G, oq, power_iter, precond_lr)
 
 
 @decorator_knowngood
@@ -2413,7 +2733,7 @@ def precond_grad_cached_(
     md = min_dtype(list(cached_q) + [ea])
     args = [q.to(md) for q in cached_q]
     args = args + [ea.to(md)]
-    expr = cached_precond_grad_expr(ndim_tuple(cached_q), grad.ndim)
+    expr = cached_precond_grad_expr(ndim_tuple(cached_q), ea.ndim)
     new = compiled_einsum(expr, *args)
     if cast:
         return new.to(ea.dtype)

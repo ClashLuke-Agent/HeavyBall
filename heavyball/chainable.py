@@ -214,6 +214,23 @@ class NoStateNoForeach(FunctionTransform):
         return updates
 
 
+class SqueezeGrad(FunctionTransform):
+    def __call__(self, state, group, update, grad, param, *args, **kwargs):
+        original_shapes = [u.shape for u in update]
+        update = [u.squeeze() if u.numel() > 1 else u.view(-1) for u in update]
+        grad = [x.view_as(u) for x, u in zip(grad, update)]
+        param = [x.view_as(u) for x, u in zip(param, update)]
+        args = list(args)
+        for i, a in enumerate(args):
+            if isinstance(a, (list, tuple)) and isinstance(a[0], Tensor):
+                args[i] = [x.view_as(u) for x, u in zip(a, update)]
+        for k, a in kwargs.items():
+            if isinstance(a, (list, tuple)) and isinstance(a[0], Tensor):
+                kwargs[k] = [x.view_as(u) for x, u in zip(a, update)]
+        out = self.fn(state, group, update, grad, param, *args, **kwargs)
+        return [o.view(s) for o, s in zip(out, original_shapes)]
+
+
 def zero_guard(*names):
     return functools.partial(ZeroGuard, names=names)
 
@@ -469,7 +486,8 @@ def _init_psgd_kron(state, group, update, grad, param, cached: bool = False, pro
         dtype=getattr(torch, group["q_dtype"]),
     )
     state["Q"] = utils.triu_to_line(Q) if group["store_triu_as_line"] else Q
-    state["running_lower_bound"] = [torch.zeros((), device=q.device, dtype=q.dtype) for q in Q]
+    state["running_lower_bound"] = [torch.zeros((2,), device=q.device, dtype=torch.float64) for q in Q]
+    state["step"] = torch.zeros((), device=param.device, dtype=torch.int64)
     if group["adaptive"]:
         state["velocity"] = [torch.zeros((), device=q.device, dtype=q.dtype) for q in Q]
     if not cached:
@@ -619,7 +637,7 @@ def scale_by_soap(group, update, grad, param, exp_avg, exp_avg_sq, Q, GG, inner:
 
 
 def _update_psgd_precond(
-    cached, Q_cache, group, param, grad, Q, velocity, running_lower_bound, prob: Optional[callable] = None
+    cached, Q_cache, group, param, grad, Q, velocity, running_lower_bound, step, prob: Optional[callable] = None
 ) -> Optional[Tensor]:
     if prob is None:
         prob = utils.precond_update_prob_schedule()
@@ -636,18 +654,19 @@ def _update_psgd_precond(
     else:
         vector, hessian_vector = utils.dampen_grad(grad, group["dampening"])
 
-    precond = (utils.inverse_free_psgd_update_precond if vector is None else utils.psgd_update_precond)(
+    precond = utils.inverse_free_psgd_update_precond(
         hessian_vector,
         group["precond_lr"],
         Q,
         group["store_triu_as_line"],
         velocity,
-        utils.beta_debias(utils.get_beta2(group), group["step"]),
+        utils.get_beta2(group),
         group["ortho_method"],
         vector,
         running_lower_bound,
         group["lower_bound_beta"],
         group["precond_update_power_iterations"],
+        step,
     )
     del vector, hessian_vector
 
@@ -719,6 +738,7 @@ def _update_lra(
     )
 
 
+@SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("U", "V", "d", init_fn=_init_psgd_lra, skip_first=False)
 @no_state
@@ -727,6 +747,7 @@ def scale_by_psgd_lra(group, update, grad, param, update_to_precond, U, V, d):
     return utils.extract_from_flat_update(param, utils.lra_precond(u, v, d, utils.flatten(update)))
 
 
+@SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("U", "V", "d", init_fn=_init_psgd_lra, skip_first=False)
 @no_state
@@ -736,6 +757,7 @@ def update_by_psgd_lra(group, update, grad, param, update_to_precond, U, V, d):
     raise SkipUpdate from None
 
 
+@SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("U", "V", "d", init_fn=_init_psgd_lra, skip_first=False)
 @no_state
@@ -744,6 +766,7 @@ def scale_by_delayed_psgd_lra(group, update, grad, param, update_to_precond, U, 
     return utils.extract_from_flat_update(param, utils.lra_precond(u, v, d, utils.flatten(update)))
 
 
+@SqueezeGrad
 @PrecondGradAccumGuard
 @general_guard("U", "V", "d", init_fn=_init_psgd_lra, skip_first=False)
 @no_state
@@ -753,8 +776,9 @@ def update_by_delayed_psgd_lra(group, update, grad, param, update_to_precond, U,
     raise SkipUpdate from None
 
 
+@SqueezeGrad
 @PrecondGradAccumGuard
-@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", init_fn=_init_psgd_kron, skip_first=False)
+@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_foreach
 def scale_by_psgd(
     group,
@@ -766,15 +790,17 @@ def scale_by_psgd(
     Q_cache,
     velocity: Optional[List[Tensor]],
     running_lower_bound: List[Tensor],
+    step: Tensor,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
-    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, prob)
+    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, step, prob)
     return _cached_psgd_precond_grad(group, update, Q, Q_cache, grad)
 
 
+@SqueezeGrad
 @PrecondGradAccumGuard
-@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", init_fn=_init_psgd_kron, skip_first=False)
+@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_foreach
 def scale_by_delayed_psgd(
     group,
@@ -786,6 +812,7 @@ def scale_by_delayed_psgd(
     Q_cache,
     velocity: Optional[List[Tensor]],
     running_lower_bound: List[Tensor],
+    step: Tensor,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
@@ -793,12 +820,15 @@ def scale_by_delayed_psgd(
         precond = None
     else:
         precond = _cached_psgd_precond_grad(group, update, Q, Q_cache, grad)
-    new = _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, prob)
+    new = _update_psgd_precond(
+        cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, step, prob
+    )
     return new if precond is None else precond
 
 
+@SqueezeGrad
 @PrecondGradAccumGuard
-@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", init_fn=_init_psgd_kron, skip_first=False)
+@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_foreach
 def update_by_psgd(
     group,
@@ -810,10 +840,11 @@ def update_by_psgd(
     Q_cache,
     velocity: Optional[List[Tensor]],
     running_lower_bound: List[Tensor],
+    step: Tensor,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
-    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, prob)
+    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, step, prob)
     _fused_cached_psgd_precond_grad(group, update, param, update, Q, Q_cache)
     raise SkipUpdate from None
 
@@ -829,8 +860,9 @@ def global_clip(group, update, grad, param, clip_fn: Optional[callable] = None):
     return clip_fn(update)
 
 
+@SqueezeGrad
 @PrecondGradAccumGuard
-@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", init_fn=_init_psgd_kron, skip_first=False)
+@general_guard("Q", "Q_cache", "velocity", "running_lower_bound", "step", init_fn=_init_psgd_kron, skip_first=False)
 @no_state_no_foreach
 def update_by_delayed_psgd(
     group,
@@ -842,11 +874,12 @@ def update_by_delayed_psgd(
     Q_cache,
     velocity: Optional[List[Tensor]],
     running_lower_bound: List[Tensor],
+    step: Tensor,
     cached: bool = False,
     prob: Optional[callable] = None,
 ):
     _fused_cached_psgd_precond_grad(group, update, param, update, Q, Q_cache)
-    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, prob)
+    _update_psgd_precond(cached, Q_cache, group, param, update_to_precond, Q, velocity, running_lower_bound, step, prob)
     raise SkipUpdate from None
 
 
