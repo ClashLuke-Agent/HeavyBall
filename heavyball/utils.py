@@ -2332,6 +2332,7 @@ def _gg_inverse_via_newtonschulz(
     min_update_step: float = 1e-6,
     svd_power_iter: int = 1,
     max_grad_norm: float = 0.01,
+    regularization_lambda: float = 1e-6,
 ):
     """
     Idea:
@@ -2365,6 +2366,7 @@ def _gg_inverse_via_newtonschulz(
     dim_size = [max(q.numel(), 1) if q.ndim < 2 else q.size(0) for q in Q]
 
     scale = _max_singular_value_ndim(G, power_iter=svd_power_iter)
+    scaled_lambda = regularization_lambda / (scale * scale).clamp(min=1e-12)
     G16 = stochastic_round_(G / scale)  # max singular value of GG should be <1
     preconds = [q.clone() for q in Q]
 
@@ -2388,13 +2390,17 @@ def _gg_inverse_via_newtonschulz(
             def _update():
                 # scale = size / P.numel()  # rescale, as X@X.T sums over X.size(1) items - we want it to
                 if p.ndim == 2 and p.numel() > 1:
-                    new = (
-                        promote(p) - promote(PP) / 2
-                    )  # / (1 + promote(PP.norm()) / promote(p.norm()))  # adaptive damping
+                    p_promoted = promote(p)
+                    PP_promoted = promote(PP)
+                    # pp_t_term = bf16_matmul(p_promoted, p_promoted.T) # Original line for regularization
+                    # PP_effective = PP_promoted + scaled_lambda * pp_t_term # Original line for regularization
+                    # damping_factor = (1 + PP_effective.norm() / p_promoted.norm().clamp(min=1e-8)) # Original line for damping
+                    new = (2 * p_promoted - PP_promoted) # Changed for standard Newton-Schulz
                     return (new + new.T) / 2  # ensure new_Q is symmetric
                 else:  # for scalar/vector L, PP is a vector -> LL/LXL == 1/sqrt(X)
-                    X_estimate = PP.double() / p.double().square().clamp(min=eps)
-                    return (1 / X_estimate.clamp(min=eps)).to(p.dtype)
+                    A_val = PP.double() / p.double().square().clamp(min=eps) # This should be G_scaled^2
+                    new_p_val = p.double() * (2.0 - A_val * p.double())
+                    return new_p_val.to(p.dtype)
 
             norms.append(PP.norm())
             new_preconds.append(_cond(norms[-1] > norm_eps, _update, lambda: p.clone()))
@@ -2411,31 +2417,34 @@ def _gg_inverse_via_newtonschulz(
     )
     _, preconds, P0, _, _ = _while_loop(_step, _body, init_state)
 
-    for new_q, oq in zip(preconds, Q):
-        store_triu_as_line = isinstance(oq, tuple)
-        if store_triu_as_line:
-            store_triu_as_line = True
-            oq = oq[1]
-        q = promote(oq)
+    for new_q, oq_item in zip(preconds, Q):
+        store_triu_as_line = isinstance(oq_item, tuple)
+        final_oq_tensor = oq_item[1] if store_triu_as_line else oq_item
 
-        new_q = promote(new_q)
-        # new_q *= scale  # technically, we need to multiply here to get the correct inverse. practically, maxsvd
-        if new_q.ndim == 2:
-            if q.shape != new_q.shape:
-                q = line_to_triu([(new_q.shape, q)], symmetric_output=True)[0]
+        q_old_promoted = promote(final_oq_tensor)
+        new_q_promoted = promote(new_q)
 
-        delta = eye_like(new_q) + precond_lr * (new_q - q)
-        delta = delta / max_singular_value(delta, power_iter=svd_power_iter).clamp(min=eps)  # align update magnitudes
-        delta = delta * (max_grad_norm * q.norm() / delta.norm().clamp(min=eps)).clamp(min=1)  # grad clip
-        new_q = multiply(multiply(delta, q), delta)  # multiplicative update rule in the lie group, from Xilin's QUAD
+        if new_q_promoted.ndim == 2 and q_old_promoted.ndim != 2:
+            # Handles cases where q_old_promoted might be, e.g., a vector for a diagonal matrix
+            # and new_q_promoted is the full matrix from Newton-Schulz.
+            # We ensure q_old_promoted is expanded to matrix form for the additive update.
+            if q_old_promoted.shape != new_q_promoted.shape:
+                 q_old_promoted = line_to_triu([(new_q_promoted.shape, q_old_promoted)], symmetric_output=True)[0]
 
-        if new_q.ndim == 2:
-            new_q = (new_q + new_q.T) / 2
-        new_q = new_q / max_singular_value(new_q, power_iter=svd_power_iter).clamp(min=eps)  # ensure update is stable
+        q_updated = q_old_promoted + precond_lr * (new_q_promoted - q_old_promoted)
 
-        if store_triu_as_line and new_q.ndim == 2:
-            new_q = triu_to_line([new_q])[0][1]
-        copy_stochastic_(oq, new_q)
+        # Normalization, ensuring to use the function's default for max_svd by not specifying it
+        norm_factor = max_singular_value(q_updated, power_iter=svd_power_iter).clamp(min=eps)
+        q_final_normalized = q_updated / norm_factor
+
+        if q_final_normalized.ndim == 2:
+            q_final_normalized = (q_final_normalized + q_final_normalized.T) / 2
+
+        if store_triu_as_line and q_final_normalized.ndim == 2:
+            final_value_to_copy = triu_to_line([q_final_normalized])[0][1]
+            final_oq_tensor.copy_(final_value_to_copy)
+        else:
+            copy_stochastic_(final_oq_tensor, q_final_normalized)
 
     return P0
 
